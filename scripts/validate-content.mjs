@@ -1,0 +1,242 @@
+/**
+ * Content validator. Bundles the lesson + glossary modules with esbuild (already
+ * present as a Vite dependency) and asserts structural invariants that the type
+ * system can't fully enforce at the value level:
+ *   - stages 0..16 all present, unique ids
+ *   - quiz answer indices in range; classification correctBuckets exist
+ *   - typed-graph edges reference existing node ids
+ *   - every visualization has a non-empty textualSummary (a11y fallback)
+ *
+ * Run: node scripts/validate-content.mjs
+ */
+import { build } from "esbuild";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { writeFileSync, rmSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const out = join(tmpdir(), `godel-content-${process.pid}.mjs`);
+
+// Bundle a tiny stub that re-exports the two modules we want to inspect.
+// (esbuild handles extensionless + .ts imports + `import type` for us.)
+const stub = join(tmpdir(), `godel-stub-${process.pid}.ts`);
+writeFileSync(
+  stub,
+  `export { LESSONS } from ${JSON.stringify(process.cwd() + "/src/content/lessons/index.ts")};
+   export { GLOSSARY } from ${JSON.stringify(process.cwd() + "/src/content/glossary.ts")};
+   export { NOTATION } from ${JSON.stringify(process.cwd() + "/src/content/notation.ts")};
+   export { SKILL_GRAPH, ROOT_GOAL_ID } from ${JSON.stringify(process.cwd() + "/src/content/graph.ts")};
+   export { ASSESSMENTS, ASSESSMENT_BY_ID, RUBRICS } from ${JSON.stringify(process.cwd() + "/src/content/assessments.ts")};`,
+);
+await build({
+  entryPoints: [stub],
+  bundle: true,
+  format: "esm",
+  outfile: out,
+  logLevel: "error",
+});
+
+const { LESSONS, GLOSSARY, NOTATION, SKILL_GRAPH, ROOT_GOAL_ID, ASSESSMENT_BY_ID, RUBRICS } = await import(pathToFileURL(out).href);
+
+const errors = [];
+const ok = (cond, msg) => { if (!cond) errors.push(msg); };
+
+// --- skill DAG invariants (ADR-0001) ---
+{
+  const lessonIds = new Set(LESSONS.map((l) => l.id));
+  const nodeIds = new Set();
+  for (const n of SKILL_GRAPH.nodes) {
+    ok(!nodeIds.has(n.id), `graph: duplicate node id ${n.id}`);
+    nodeIds.add(n.id);
+    if (n.kind === "concept" || n.kind === "skill")
+      ok(lessonIds.has(n.lessonId), `graph: node ${n.id} lessonId "${n.lessonId}" not a real stage`);
+    if (n.kind === "achievement")
+      ok(Array.isArray(n.assessmentIds) && n.assessmentIds.length > 0, `graph: achievement ${n.id} has no assessmentIds`);
+  }
+  // edges reference existing nodes
+  for (const e of SKILL_GRAPH.edges) {
+    ok(nodeIds.has(e.source), `graph: edge ${e.id} bad source ${e.source}`);
+    ok(nodeIds.has(e.target), `graph: edge ${e.id} bad target ${e.target}`);
+  }
+  // acyclic (DFS over prerequisite_for)
+  const adj = {};
+  for (const id of nodeIds) adj[id] = [];
+  for (const e of SKILL_GRAPH.edges) if (e.kind === "prerequisite_for") adj[e.source].push(e.target);
+  const WHITE = 0, GREY = 1, BLACK = 2;
+  const color = {};
+  for (const id of nodeIds) color[id] = WHITE;
+  let cycle = null;
+  const visit = (u, path) => {
+    color[u] = GREY;
+    for (const v of adj[u]) {
+      if (color[v] === GREY) { cycle = [...path, u, v].join(" → "); return; }
+      if (color[v] === WHITE) { visit(v, [...path, u]); if (cycle) return; }
+    }
+    color[u] = BLACK;
+  };
+  for (const id of nodeIds) { if (color[id] === WHITE) visit(id, []); if (cycle) break; }
+  ok(!cycle, `graph: prerequisite cycle: ${cycle}`);
+  // every achievement reachable from a root (a node with no prereqs)
+  const hasPrereq = new Set(SKILL_GRAPH.edges.filter((e) => e.kind === "prerequisite_for").map((e) => e.target));
+  const roots = [...nodeIds].filter((id) => !hasPrereq.has(id));
+  const reach = new Set(roots);
+  const q = [...roots];
+  while (q.length) { const u = q.shift(); for (const v of adj[u]) if (!reach.has(v)) { reach.add(v); q.push(v); } }
+  for (const n of SKILL_GRAPH.nodes)
+    if (n.kind === "achievement") ok(reach.has(n.id), `graph: achievement ${n.id} unreachable from roots`);
+  ok(nodeIds.has(ROOT_GOAL_ID), `graph: ROOT_GOAL_ID ${ROOT_GOAL_ID} is not a node`);
+
+  // assessments: each achievement's assessmentIds resolve; each task targets an
+  // achievement node; remediation + rubric refs resolve.
+  for (const n of SKILL_GRAPH.nodes) {
+    if (n.kind !== "achievement") continue;
+    for (const aid of n.assessmentIds ?? [])
+      ok(!!ASSESSMENT_BY_ID[aid], `graph: achievement ${n.id} → unknown assessment ${aid}`);
+  }
+  for (const t of Object.values(ASSESSMENT_BY_ID)) {
+    const target = SKILL_GRAPH.nodes.find((n) => n.id === t.nodeId);
+    ok(target && target.kind === "achievement", `assessment ${t.id}: nodeId ${t.nodeId} is not an achievement node`);
+    if (t.openEnded) ok(!!RUBRICS[t.openEnded.rubricId], `assessment ${t.id}: unknown rubric ${t.openEnded.rubricId}`);
+    for (const m of t.fatalMisconceptions)
+      for (const r of m.remediationNodeIds)
+        ok(nodeIds.has(r), `assessment ${t.id}: misconception ${m.id} → unknown remediation node ${r}`);
+  }
+}
+
+// Every @n{key}/@t{slug} reference must resolve — no undefined symbols (fail loud).
+const notationKeys = new Set(Object.keys(NOTATION));
+const glossarySlugs = new Set(GLOSSARY.map((g) => g.term.toLowerCase()));
+const TOKEN_RE = /@n\{([^}]+)\}|@t\{([^}|]+)(?:\|[^}]+)?\}/g;
+for (const l of LESSONS) {
+  const strings = [
+    l.summary, l.masteryCheckpoint, ...l.objectives,
+    ...l.definitions.flatMap((d) => [d.short, d.expanded ?? "", d.example ?? ""]),
+    ...l.sections.map((s) => s.body),
+    ...l.confusions.flatMap((c) => [c.misconception, c.correction]),
+    ...l.quiz.map((q) => q.prompt + " " + (q.explanation ?? "")),
+  ];
+  for (const s of strings) {
+    for (const m of s.matchAll(TOKEN_RE)) {
+      if (m[1]) ok(notationKeys.has(m[1]), `stage ${l.stage}: @n{${m[1]}} not in NOTATION`);
+      if (m[2]) ok(glossarySlugs.has(m[2].toLowerCase()), `stage ${l.stage}: @t{${m[2]}} not in glossary`);
+    }
+  }
+}
+
+// Stage coverage + unique ids
+const stages = LESSONS.map((l) => l.stage);
+const maxStage = Math.max(...stages);
+for (let s = 0; s <= maxStage; s++) ok(stages.includes(s), `missing stage ${s}`);
+const ids = new Set();
+for (const l of LESSONS) {
+  ok(!ids.has(l.id), `duplicate lesson id ${l.id}`);
+  ids.add(l.id);
+  ok(l.quiz.length >= 3, `stage ${l.stage}: <3 quiz questions`);
+  ok(l.visualizations.length >= 1, `stage ${l.stage}: no visualization`);
+  ok(l.confusions.length >= 2, `stage ${l.stage}: <2 confusion boxes`);
+  ok(!!l.masteryCheckpoint, `stage ${l.stage}: no mastery checkpoint`);
+
+  // Visualizations
+  for (const v of l.visualizations) {
+    ok(!!v.textualSummary && v.textualSummary.length > 20, `stage ${l.stage} viz ${v.id}: weak/missing textualSummary`);
+    if (v.kind === "typed-graph") {
+      const nodeIds = new Set(v.nodes.map((n) => n.id));
+      for (const e of v.edges) {
+        ok(nodeIds.has(e.source), `stage ${l.stage} viz ${v.id}: edge ${e.id} bad source ${e.source}`);
+        ok(nodeIds.has(e.target), `stage ${l.stage} viz ${v.id}: edge ${e.id} bad target ${e.target}`);
+      }
+    }
+    if (v.kind === "comparison-table") {
+      for (const row of v.rows)
+        for (const c of Object.keys(row.cells))
+          ok(v.columns.includes(c), `stage ${l.stage} viz ${v.id}: row cell column "${c}" not in columns`);
+    }
+  }
+
+  // Quiz answer integrity
+  for (const q of l.quiz) {
+    if (q.type === "multiple-choice")
+      ok(q.correct >= 0 && q.correct < q.options.length, `stage ${l.stage} ${q.id}: correct index OOR`);
+    if (q.type === "multi-select")
+      for (const i of q.correct) ok(i >= 0 && i < q.options.length, `stage ${l.stage} ${q.id}: multi index OOR`);
+    if (q.type === "classification") {
+      for (const it of q.items)
+        ok(q.buckets.includes(it.correctBucket), `stage ${l.stage} ${q.id}: bucket "${it.correctBucket}" missing`);
+    }
+    if (q.type === "matching") {
+      const rids = new Set(q.right.map((r) => r.id));
+      for (const l2 of q.left)
+        ok(rids.has(q.pairs[l2.id]), `stage ${l.stage} ${q.id}: pair for ${l2.id} -> unknown right`);
+    }
+    if (q.type === "fill-in")
+      ok(Array.isArray(q.accepted) && q.accepted.length > 0, `stage ${l.stage} ${q.id}: no accepted answers`);
+    ok(!!q.explanation, `stage ${l.stage} ${q.id}: no explanation`);
+  }
+}
+
+// --- reference closure: no forward references (SPRINT CF2) ---
+// A @t{term} reference is valid only if the term is introduced (defined in a
+// lesson) at the referencing node itself or a transitive prerequisite — i.e. it
+// has "already been explained". Orientation nodes preview deliberately and are
+// exempt. @n{} notation chips are self-contained, so they're always available.
+{
+  const EXEMPT = new Set(["cat-orientation"]); // optional "Think in Arrows" orientation
+  const PRIMITIVES = new Set(["set", "function", "type", "element"]); // assumed prior
+  const lessonNode = {};
+  for (const n of SKILL_GRAPH.nodes) if (n.lessonId) lessonNode[n.lessonId] = n.id;
+  const introducedAt = {};
+  for (const l of LESSONS) {
+    const nodeId = lessonNode[l.id];
+    if (!nodeId) continue;
+    for (const d of l.definitions) (introducedAt[d.term.toLowerCase()] ??= new Set()).add(nodeId);
+  }
+  const parents = {};
+  for (const n of SKILL_GRAPH.nodes) parents[n.id] = [];
+  for (const e of SKILL_GRAPH.edges) if (e.kind === "prerequisite_for") parents[e.target].push(e.source);
+  const ancCache = {};
+  const ancestors = (id) => {
+    if (ancCache[id]) return ancCache[id];
+    const seen = new Set(); const st = [...parents[id]];
+    while (st.length) { const u = st.pop(); if (seen.has(u)) continue; seen.add(u); st.push(...parents[u]); }
+    return (ancCache[id] = seen);
+  };
+  const TREF = /@t\{([^}|]+)(?:\|[^}]+)?\}/g;
+  for (const l of LESSONS) {
+    if (EXEMPT.has(l.id)) continue;
+    const nodeId = lessonNode[l.id];
+    if (!nodeId) continue;
+    const anc = ancestors(nodeId);
+    const strings = [
+      l.summary, l.masteryCheckpoint, ...l.objectives,
+      ...l.definitions.flatMap((d) => [d.short, d.expanded ?? "", d.example ?? ""]),
+      ...l.sections.map((s) => s.body),
+      ...l.confusions.flatMap((c) => [c.misconception, c.correction]),
+      ...l.quiz.map((q) => q.prompt + " " + (q.explanation ?? "")),
+    ];
+    for (const s of strings) for (const m of s.matchAll(TREF)) {
+      const term = m[1].toLowerCase();
+      if (PRIMITIVES.has(term)) continue;
+      const intro = introducedAt[term];
+      const available = intro && [...intro].some((nid) => nid === nodeId || anc.has(nid));
+      if (!available)
+        ok(false, `forward-ref stage ${l.stage} (${nodeId}): @t{${m[1]}} — ${intro ? "introduced only at [" + [...intro].join(",") + "], not a prerequisite" : "not defined in any lesson"}`);
+    }
+  }
+}
+
+// Glossary uniqueness
+const gterms = new Set();
+for (const g of GLOSSARY) {
+  ok(!gterms.has(g.term.toLowerCase()), `duplicate glossary term ${g.term}`);
+  gterms.add(g.term.toLowerCase());
+}
+
+rmSync(out, { force: true });
+rmSync(stub, { force: true });
+
+if (errors.length) {
+  console.error(`✗ content validation: ${errors.length} problem(s)`);
+  for (const e of errors) console.error("  - " + e);
+  process.exit(1);
+}
+console.log(`✓ content valid: ${LESSONS.length} stages, ${GLOSSARY.length} glossary terms, ${Object.keys(NOTATION).length} symbols, ${SKILL_GRAPH.nodes.length} graph nodes / ${SKILL_GRAPH.edges.length} edges (acyclic), all consistent`);

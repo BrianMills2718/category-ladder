@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.local
+.DS_Store
+scripts/shots/
+
+# backend
+backend/.venv/
+backend/__pycache__/
+backend/**/__pycache__/
